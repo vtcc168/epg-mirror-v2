@@ -1,0 +1,91 @@
+name: 更新 EPG 数据
+on:
+  schedule:
+    - cron: '0 6,23 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  update-epg:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出仓库代码
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          clean: true
+
+      - name: 安装依赖+配置Git环境
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxml2-utils
+          echo "*.gz binary" > .gitattributes
+          git config --global core.autocrlf false
+          git config --global user.name "GitHub Actions"
+          git config --global user.email "actions@github.com"
+
+      # 【关键修复】先拉取远程最新代码，此时仓库干净无修改，不会报错
+      - name: 同步远程仓库最新代码
+        run: |
+          git pull origin main --rebase
+
+      - name: 下载→校验→压缩→仅推送GZ文件
+        run: |
+          # 强化版浏览器伪装下载，已验证可正常拉取119M完整文件
+          echo "📥 从 pie.bz 下载 EPG（伪装浏览器）"
+          curl -L -f --retry 5 --retry-delay 10 --max-time 600 \
+            -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" \
+            -H "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8" \
+            -H "Accept-Language: zh-CN,zh;q=0.8,en-US;q=0.5,en;q=0.3" \
+            -H "Connection: keep-alive" \
+            -o epg.xml "https://pie.bz/xmltv.php?username=${{ secrets.EPG_USERNAME }}&password=${{ secrets.EPG_PASSWORD }}"
+
+          # 校验1：文件非空
+          if [ ! -s epg.xml ]; then
+            echo "❌ 下载失败：文件为空"
+            exit 1
+          fi
+          echo "✅ 下载完成，文件大小: $(du -h epg.xml | cut -f1)"
+
+          # 校验2：XML语法完整，无截断
+          echo "🔍 校验 XML 文件完整性"
+          if ! xmllint --noout epg.xml 2>&1; then
+            echo "❌ XML 文件不完整/语法错误，终止推送"
+            exit 1
+          fi
+          echo "✅ XML 校验通过，文件完整可用"
+
+          # 最高级别压缩，体积最小化（119M压缩后通常30-40M，远低于100M限制）
+          echo "🗜️ 生成 epg.xml.gz 压缩包"
+          gzip -9 -c epg.xml > epg.xml.gz
+
+          # 校验压缩包无损坏
+          if ! gzip -t epg.xml.gz; then
+            echo "❌ 压缩包结构损坏"
+            exit 1
+          fi
+          # 校验解压后内容与源文件100%一致
+          gzip -dc epg.xml.gz > epg_test.xml
+          if ! diff -q epg.xml epg_test.xml; then
+            echo "❌ 压缩包解压后内容不一致"
+            exit 1
+          fi
+          echo "✅ 压缩包校验通过，100%可用"
+
+          # 删除临时XML文件，仅保留GZ压缩包
+          rm -f epg.xml epg_test.xml
+          # 清理仓库中残留的旧XML文件
+          git rm -f --ignore-unmatch epg.xml
+
+          # 提交并推送文件
+          git add -f .gitattributes epg.xml.gz ':!.github'
+          if git diff --cached --quiet; then
+            echo "ℹ️ 文件内容无变化，无需更新"
+            exit 0
+          fi
+
+          git commit -m "自动更新 EPG 数据（仅GZ格式，已通过完整性校验）"
+          git push origin HEAD
+          echo "✅ 全部完成！仓库已更新 epg.xml.gz 文件"
